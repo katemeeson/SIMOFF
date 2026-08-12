@@ -15,6 +15,7 @@ INPUT
     max_iter: int, optional. The maximum number of global search iterations. Default value is 1000 (see https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.dual_annealing.html dual_annealing function)
     initialtemp: float, optional. The initial temperature, use higher values to facilitates a wider search of the energy landscape, allowing dual_annealing to escape local minima that it is trapped in. Default value is 5230. Range is (0.01, 5.e4) (see https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.dual_annealing.html dual_annealing function). Default value is 5230
     maxfun: int, optional. Soft limit for the number of objective function calls. If the algorithm is in the middle of a local search, this number will be exceeded, the algorithm will stop just after the local search is done (see https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.dual_annealing.html dual_annealing function). Default value is 10000000
+    stop_at_first_perfect: bool, optional. If True, SIMOFF stops when the first 100% accurate solution is found. If False, the successful annealing run continues to max_iter/maxfun and returns a dataframe containing all maximum-accuracy solutions.
     
 METHOD
     SIMOFF will compare the Flux Balance Analysis flux distribution resulting from each objective function to qualitative_constraints. Dual annealing is used to reach the most appropriate objective function. Hyperparameters should be defined by user
@@ -26,6 +27,7 @@ OUTPUT
     which of these is the 
     log_df: DataFrame, rows are individual iterations; first column is a list of reaction coefficients for this iteration with the same index as input_reactions; second column is the accuracy (decimal) achieved using these coefficients; third is a dictionary of absolute fluxes (values) predicted for each reaction in qualitative_constraints (keys) for this iteration
     agreement_df: DataFrame, rows are individual reactions in the qualitative_constraints and columns are mismatch values (either 0 for disagreement or 1 for agreement) between the FBA predicted fluxes for each iteration (each iteration is a separate column) and qualitative_criteria
+    If stop_at_first_perfect is False, returns (results, max_accuracy_df), where max_accuracy_df contains all iterations that achieved the maximum accuracy observed during the SIMOFF run.
 """
 
 def simoff(
@@ -35,14 +37,18 @@ def simoff(
     bounds=None,
     max_iter=1000,
     initialtemp=5230,
-    maxfun=10000000
+    maxfun=10000000,
+    stop_at_first_perfect=True
 ):
     """
     Run annealing optimisation on all combinations of input reactions (length>1).
-    Stops early if perfect accuracy (1.0) is reached.
+    By default, stops early if perfect accuracy (1.0) is reached.
     
     Returns a dict mapping tuples of reaction IDs to results:
     { combo: (coefficients_dict, accuracy, log_df, agreement_df) }
+
+    If stop_at_first_perfect is False, returns:
+    (results, max_accuracy_df)
     """
     warnings.filterwarnings('ignore', 
                            message='DataFrame is highly fragmented', 
@@ -113,8 +119,10 @@ def simoff(
 
     print(f"\n🧊 Optimisation: fitting objective(s) {input_reactions} "
           f"to match {len(qualitative_constraints)} qualitative constraints")
+
+    class PerfectAccuracyFound(Exception):
+        pass
     
-    # Inner function is basically your annealing_2, but only for a single combo
     def _annealing_single(objective_reactions):
         selected_rxns = list(qualitative_constraints.keys())
         results_log = []
@@ -150,9 +158,9 @@ def simoff(
             results_log.append({'coefficients': c.tolist(), 'accuracy': accuracy, 'fluxes': flux_dict})
             agreement_matrix[len(results_log) - 1] = agreement_dict
 
-            if accuracy == 1.0:
+            if accuracy == 1.0 and stop_at_first_perfect:
                 early_stop_data = (dict(zip(objective_reactions, c)), accuracy)
-                raise SystemExit
+                raise PerfectAccuracyFound
             return 1 - accuracy
 
         # Auto temperature
@@ -175,7 +183,7 @@ def simoff(
                 initial_temp=temp,
                 maxfun=maxfun
             )
-        except SystemExit:
+        except PerfectAccuracyFound:
             if early_stop_data is not None:
                 coeffs, acc = early_stop_data
                 log_df = pd.DataFrame(results_log)
@@ -200,6 +208,48 @@ def simoff(
 
         return dict(zip(objective_reactions, scaled_coeffs)), accuracy, log_df, agreement_df
 
+    def _collect_max_accuracy_solutions(search_results):
+        rows = []
+        max_accuracy = None
+
+        for combo, combo_result in search_results.items():
+            log_df = combo_result[2]
+            if log_df.empty:
+                continue
+
+            combo_max = log_df['accuracy'].max()
+            if max_accuracy is None or combo_max > max_accuracy:
+                max_accuracy = combo_max
+
+        if max_accuracy is None:
+            return pd.DataFrame(
+                columns=['combination', 'iteration', 'coefficients',
+                         'coefficient_dict', 'accuracy', 'fluxes']
+            )
+
+        for combo, combo_result in search_results.items():
+            log_df = combo_result[2]
+            if log_df.empty:
+                continue
+
+            max_rows = log_df[np.isclose(log_df['accuracy'], max_accuracy)]
+            for iteration, row in max_rows.iterrows():
+                coefficients = row['coefficients']
+                rows.append({
+                    'combination': combo,
+                    'iteration': iteration,
+                    'coefficients': coefficients,
+                    'coefficient_dict': dict(zip(combo, coefficients)),
+                    'accuracy': row['accuracy'],
+                    'fluxes': row['fluxes']
+                })
+
+        return pd.DataFrame(
+            rows,
+            columns=['combination', 'iteration', 'coefficients',
+                     'coefficient_dict', 'accuracy', 'fluxes']
+        )
+
     # Run for each combo
     print('🔸 Running SIMOFF across different reaction combinations...')
     for combo in all_combos:
@@ -212,5 +262,9 @@ def simoff(
         else:
             print(f"SIMOFF suggested coefficients:{results[tuple(combo)][0]}")    
             print(f"Accuracy achieved:{results[tuple(combo)][1]*100}%")
+
+    if not stop_at_first_perfect:
+        max_accuracy_df = _collect_max_accuracy_solutions(results)
+        return results, max_accuracy_df
 
     return results
